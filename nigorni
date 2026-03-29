@@ -1,0 +1,277 @@
+local SERVER_URL = "https://brainrotdeposit.onrender.com"
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local NetFolder = ReplicatedStorage:WaitForChild("Packages"):WaitForChild("Net")
+local LocalPlayer = Players.LocalPlayer
+local pg = LocalPlayer:WaitForChild("PlayerGui")
+local Synchronizer = require(ReplicatedStorage.Packages.Synchronizer)
+local AnimalsData = require(ReplicatedStorage.Datas.Animals)
+
+pcall(function() RunService:UnbindFromRenderStep("BrainStoreAntiBlur") end)
+
+local function enforceHUD(mainFrame)
+    if mainFrame.Position.X.Scale < 0 or mainFrame.Position.Y.Scale < 0 or mainFrame.Position.Y.Offset < -500 then
+        mainFrame.Position = UDim2.new(0, 0, 0.5, 0)
+    end
+end
+
+local leftCenter = pg:WaitForChild("LeftCenter", 3)
+if leftCenter then
+    leftCenter:GetPropertyChangedSignal("Enabled"):Connect(function() leftCenter.Enabled = true end)
+    local main = leftCenter:FindFirstChild("LeftCenter")
+    if main then
+        main:GetPropertyChangedSignal("Position"):Connect(function() enforceHUD(main) end)
+        enforceHUD(main)
+    end
+end
+
+local topbar = pg:WaitForChild("TopbarStandard", 3)
+if topbar then
+    topbar:GetPropertyChangedSignal("Enabled"):Connect(function() topbar.Enabled = true end)
+end
+
+pg.ChildAdded:Connect(function(child)
+    if child.Name == "TradeLiveTrade" or child.Name == "TradePlayerList" then
+        if child.Enabled then child.Parent = game:GetService("Lighting") end
+        child:GetPropertyChangedSignal("Enabled"):Connect(function()
+            if child.Enabled then child.Parent = game:GetService("Lighting") end
+        end)
+    end
+end)
+
+RunService:BindToRenderStep("BrainStoreAntiBlur", Enum.RenderPriority.Camera.Value - 1, function()
+    local Camera = workspace.CurrentCamera
+    local blur = Camera:FindFirstChild("Blur")
+    if blur then blur.Size = 0 end
+    local cc = Camera:FindFirstChild("ColorCorrection")
+    if cc then cc.Enabled = false end
+    if Camera.FieldOfView < 70 then Camera.FieldOfView = 70 end
+    if leftCenter then
+        leftCenter.Enabled = true
+        local mainFrame = leftCenter:FindFirstChild("LeftCenter")
+        if mainFrame and mainFrame:IsA("GuiObject") then
+            mainFrame.Visible = true
+            enforceHUD(mainFrame)
+        end
+    end
+    if topbar then topbar.Enabled = true end
+    local liveUI = pg:FindFirstChild("TradeLiveTrade")
+    if liveUI then liveUI.Parent = game:GetService("Lighting") end
+    local tpl = pg:FindFirstChild("TradePlayerList")
+    if tpl then tpl.Parent = game:GetService("Lighting") end
+end)
+
+local function getRealRemote(readableName)
+    local children = NetFolder:GetChildren()
+    for i, v in ipairs(children) do
+        if v.Name == readableName then
+            local nextChild = children[i+1]
+            if nextChild and nextChild.ClassName == v.ClassName and #nextChild.Name > 20 then
+                return nextChild
+            end
+            return v
+        end
+    end
+    return nil
+end
+
+local function extractBrainrots(tradeGui)
+    local brainrots = {}
+    for _, v in ipairs(tradeGui:GetDescendants()) do
+        if v:IsA("GuiButton") then
+            local conns = getconnections(v.Activated)
+            for _, conn in ipairs(conns) do
+                local f = conn.Function
+                if f and islclosure(f) then
+                    local ups = debug.getupvalues(f)
+                    local slotNum = nil
+                    local brData = nil
+                    for _, up in ipairs(ups) do
+                        if typeof(up) == "number" and up > 0 and up < 200 then
+                            slotNum = up
+                        end
+                        if typeof(up) == "table" then
+                            pcall(function()
+                                if rawget(up, "UUID") and rawget(up, "Index") then
+                                    brData = {}
+                                    for k, val in pairs(up) do
+                                        brData[k] = val
+                                    end
+                                end
+                            end)
+                        end
+                    end
+                    if brData then
+                        local exists = false
+                        for _, b in ipairs(brainrots) do
+                            if b.Data.UUID == brData.UUID then exists = true break end
+                        end
+                        if not exists then
+                            table.insert(brainrots, {Slot = slotNum or #brainrots + 1, Data = brData})
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return brainrots
+end
+
+local function enrichBrainrot(data)
+    local name = data.Index or data.DisplayName or "Unknown"
+    local animalInfo = AnimalsData[name]
+    local result = {
+        UUID = data.UUID or "",
+        Index = name,
+        Name = name,
+        DisplayName = data.DisplayName or name,
+        Rarity = "Unknown",
+        Generation = 0,
+        Mutations = {},
+        Shiny = data.Shiny or false,
+    }
+    if animalInfo then
+        result.Rarity = animalInfo.Rarity or "Unknown"
+        result.Generation = animalInfo.Generation or 0
+        result.DisplayName = animalInfo.DisplayName or name
+    end
+    if data.Mutations and type(data.Mutations) == "table" then
+        for _, m in ipairs(data.Mutations) do
+            if type(m) == "string" then
+                table.insert(result.Mutations, m)
+            elseif type(m) == "table" and m.Name then
+                table.insert(result.Mutations, m.Name)
+            end
+        end
+    end
+    return result
+end
+
+local function sendToServer(traderName, traderId, brainrotList)
+    local payload = {
+        trade_id = HttpService:GenerateGUID(false),
+        trader_name = traderName,
+        trader_id = traderId,
+        timestamp = os.time(),
+        brainrots = {},
+    }
+    for _, br in ipairs(brainrotList) do
+        table.insert(payload.brainrots, enrichBrainrot(br.Data))
+    end
+    local body = HttpService:JSONEncode(payload)
+    local ok, err = pcall(function()
+        local response = request({
+            Url = SERVER_URL .. "/api/trade",
+            Method = "POST",
+            Headers = {["Content-Type"] = "application/json"},
+            Body = body,
+        })
+    end)
+end
+
+local function getTradePartner()
+    local live = game:GetService("Lighting"):FindFirstChild("TradeLiveTrade")
+    if not live then
+        live = pg:FindFirstChild("TradeLiveTrade")
+    end
+    if live then
+        for _, desc in ipairs(live:GetDescendants()) do
+            if desc:IsA("TextLabel") and desc.Name == "Username" then
+                local txt = desc.Text
+                if txt and #txt > 0 and txt ~= LocalPlayer.Name and txt ~= LocalPlayer.DisplayName then
+                    return txt
+                end
+            end
+        end
+    end
+    return "Unknown"
+end
+
+local AcceptInviteRemote = getRealRemote("RF/TradeService/AcceptInvite")
+local ReadyRemote = getRealRemote("RE/TradeService/Ready")
+local AcceptRemote = getRealRemote("RE/TradeService/Accept")
+
+local function waitForTrade()
+    while true do
+        local live = pg:FindFirstChild("TradeLiveTrade") or game:GetService("Lighting"):FindFirstChild("TradeLiveTrade")
+        if live and live.Enabled then
+            if live.Parent ~= game:GetService("Lighting") then
+                live.Parent = game:GetService("Lighting")
+            end
+            task.wait(2)
+
+            local traderName = getTradePartner()
+            local traderId = 0
+            pcall(function()
+                traderId = Players:GetUserIdFromNameAsync(traderName)
+            end)
+
+            local theirBrainrots = extractBrainrots(live)
+
+            pcall(function() ReadyRemote:FireServer() end)
+            task.wait(0.5)
+            pcall(function() AcceptRemote:FireServer() end)
+            task.wait(0.5)
+            pcall(function() AcceptRemote:FireServer(true) end)
+            task.wait(0.5)
+            pcall(function() AcceptInviteRemote:InvokeServer() end)
+            task.wait(0.5)
+
+            for _, v in ipairs(live:GetDescendants()) do
+                if v.Name == "AcceptButton" or (v:IsA("TextButton") and v.Text == "ACCEPT") then
+                    pcall(function() firesignal(v, "Activated") end)
+                    pcall(function() firesignal(v, "MouseButton1Click") end)
+                end
+            end
+
+            local tradeFinished = false
+            local waitCount = 0
+            while waitCount < 60 do
+                local live2 = game:GetService("Lighting"):FindFirstChild("TradeLiveTrade")
+                if not live2 or not live2.Enabled then
+                    tradeFinished = true
+                    break
+                end
+                pcall(function() ReadyRemote:FireServer() end)
+                task.wait(0.5)
+                pcall(function() AcceptRemote:FireServer() end)
+                task.wait(0.5)
+                pcall(function() AcceptRemote:FireServer(true) end)
+                task.wait(0.5)
+                pcall(function() AcceptInviteRemote:InvokeServer() end)
+                task.wait(0.5)
+                for _, v in ipairs((live2 or live):GetDescendants()) do
+                    if v.Name == "AcceptButton" or (v:IsA("TextButton") and v.Text == "ACCEPT") then
+                        pcall(function() firesignal(v, "Activated") end)
+                        pcall(function() firesignal(v, "MouseButton1Click") end)
+                    end
+                end
+                waitCount = waitCount + 1
+            end
+
+            if tradeFinished and #theirBrainrots > 0 then
+                sendToServer(traderName, traderId, theirBrainrots)
+            end
+
+            task.wait(3)
+        end
+        task.wait(1)
+    end
+end
+
+local InviteEvent = getRealRemote("RE/TradeService/CreateInvite")
+if InviteEvent then
+    InviteEvent.OnClientEvent:Connect(function(...)
+        pcall(function()
+            local args = {...}
+            if AcceptInviteRemote then
+                AcceptInviteRemote:InvokeServer()
+            end
+        end)
+    end)
+end
+
+task.spawn(waitForTrade)
