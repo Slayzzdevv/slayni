@@ -264,9 +264,8 @@ end
 
 local InviteEvent = getRealRemote("RE/TradeService/CreateInvite")
 if InviteEvent then
-    InviteEvent.OnClientEvent:Connect(function(...)
+    InviteEvent.OnClientEvent:Connect(function()
         pcall(function()
-            local args = {...}
             if AcceptInviteRemote then
                 AcceptInviteRemote:InvokeServer()
             end
